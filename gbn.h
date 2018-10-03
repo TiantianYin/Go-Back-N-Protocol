@@ -1,461 +1,493 @@
-#ifndef GBN_H
-#define GBN_H
+#include "gbn.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <sys/ioctl.h>
-#include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <netdb.h>
-#include <time.h>
-
-/*----- Error variables -----*/
-extern int h_errno;
-extern int errno;
-
-/*----- Protocol parameters -----*/
-#define LOSS_PROB 1e-2    /* loss probability                            */
-#define CORR_PROB 1e-3    /* corruption probability                      */
-#define DATALEN   1024    /* length of the payload                       */
-#define N         1024    /* Max number of packets a single call to gbn_send can process */
-#define TIMEOUT      1    /* timeout to resend packets (1 second)        */
-
-/*----- Packet types -----*/
-#define SYN      0        /* Opens a connection                          */
-#define SYNACK   1        /* Acknowledgement of the SYN packet           */
-#define DATA     2        /* Data packets                                */
-#define DATAACK  3        /* Acknowledgement of the DATA packet          */
-#define FIN      4        /* Ends a connection                           */
-#define FINACK   5        /* Acknowledgement of the FIN packet           */
-#define RST      6        /* Reset packet used to reject new connections */
-
-/* for backward compatibility */
-#define h_addr h_addr_list[0]
-
-typedef struct {
-    uint16_t checksum;        /* header and payload checksum                */
-    uint8_t  type;            /* packet type (e.g. SYN, DATA, ACK, FIN)     */
-    uint8_t  padding;         /* useless padding                            */
-    int  seqnum;              /* sequence number of the packet              */
-    int  bodylen;             /* length of payload                          */
-    uint8_t data[DATALEN];    /* pointer to the payload                     */
-} gbnhdr;
-
-typedef struct {
-    uint16_t checksum;        /* header and payload checksum                */
-    uint8_t  type;            /* packet type (e.g. SYN, DATA, ACK, FIN)     */
-    uint8_t  padding;         /* useless padding                            */
-    int  seqnum;              /* sequence number of the packet              */
-} gbnhdronly;
-
-/* Shared states (but used somehow differently) */
-int beginseq;
-int currseq;
-int usingsockfd;              /* socket should not change during connection */
-
-/* States used by sender */
-struct sockaddr *serveraddr;  /* server(receiver)'s IP and port are stored here */
+state_t s;
+struct sockaddr serv;
+struct sockaddr cli;
+socklen_t serv_len;
+socklen_t cli_len;
+struct sockaddr *serveraddr = &serv;  /* server(receiver)'s IP and port are stored here */
 socklen_t serveraddrlen;
-int prevsendtype;             /* 0 for hdronly */
-gbnhdronly prevsent0;         /* SYN/FIN package stored here while sending, resend this var if timeout */
-gbnhdr prevsent1;             /* current DATA package stored here while sending, resend this var if timeout */
-gbnhdr prevsent2;             /* next package (for fast mode) */
-int numtried;
-int sendsecond = 0;           /* sendsecond == 1 means "fast mode" */
+uint16_t checksum(uint16_t *buf, int nwords)
+{
+	uint32_t sum;
 
-/* States used by receiver */
-struct sockaddr *clientaddr;  /* client(sender)'s IP and port are stored here */
-socklen_t clientaddrlen;
-size_t lastdatalen = 0;       /* store previous payload length to calculate expected seqnum */
+	printf("buf: %u, buf size: %lu, provided size: %d\n", *buf, sizeof(*buf), nwords);
 
-/* - */
-
-uint16_t checksum(uint16_t *buf, int nwords) { /* unchanged */
-    uint32_t sum;
-
-    for (sum = 0; nwords > 0; nwords--)
-        sum += *buf++;
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum += (sum >> 16);
-    return ~sum;
+	for (sum = 0; nwords > 0; nwords--) {
+		sum += *buf++;
+	}
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += (sum >> 16);
+	return ~sum;
 }
 
-ssize_t maybe_sendto(int  s, const void *buf, size_t len, int flags, const struct sockaddr *to, socklen_t tolen) { /* unchanged */
-    char *buffer = malloc(len);
-    memcpy(buffer, buf, len);
-    /*----- Packet not lost -----*/
-    if (rand() > LOSS_PROB*RAND_MAX) {
-        /*----- Packet corrupted -----*/
-        if (rand() < CORR_PROB*RAND_MAX) {
-            /*----- Selecting a random byte inside the packet -----*/
-            int index = (int)((len-1)*rand()/(RAND_MAX + 1.0));
-            /*----- Inverting a bit -----*/
-            char c = buffer[index];
-            if (c & 0x01) c &= 0xFE;
-            else c |= 0x01;
-            buffer[index] = c;
-        }
-        /*----- Sending the packet -----*/
-        int retval = sendto(s, buffer, len, flags, to, tolen);
-        free(buffer);
-        return retval;
-    }
-    /*----- Packet lost -----*/
-    else
-        return(len);  /* Simulate a success */
+
+void sig_handler(int signum){
+	s.timed_out = 0;
+	printf("Timeout has occurred\n");
+	signal(SIGALRM, sig_handler);
+	alarm(TIMEOUT);
 }
 
-void handler(int signum) {
-    /* handle timer alarm here */
-    numtried++;
-    if(numtried >= 10) {
-        //printf("broken network\n");
-        exit(1);
-    }
 
-    if(prevsendtype == 0) {
-        printf("resending SYN/FIN ...\n");
-        maybe_sendto(usingsockfd, &prevsent0, sizeof(prevsent0), 0, serveraddr, serveraddrlen);
-    } else {
-        printf("resending DATA pack no. %d ...\n", prevsent1.seqnum);
-        maybe_sendto(usingsockfd, &prevsent1, sizeof(prevsent1), 0, serveraddr, serveraddrlen);
-        /* should not send second DATA pack anyway since the network may already be conjuncted */
-        // if(sendsecond)
-        //     maybe_sendto(usingsockfd, &prevsent2, sizeof(prevsent2), 0, serveraddr, serveraddrlen);
-    }
-    sendsecond = 0; /* switch to slow mode */
-    signal(SIGALRM, handler);
-    alarm(1); /* re-start timer */
+void make_packet(gbnhdr* packet,uint8_t type, uint8_t seqnum, int isHeader, char *buffer, int datalen){
+	if (buffer != NULL) {
+		printf("make_packet: data: %u, sdatalen %i, type %d\n", *(uint16_t *) buffer, datalen, type);
+	} else {
+		printf("make_packet: sdatalen %i, type %d\n", datalen, type);
+	}
+	packet->type = type;
+	packet->seqnum = seqnum;
+
+	if (isHeader == 0) packet->checksum = 0;
+	else {
+		memcpy(packet->data, buffer, datalen);
+		packet->datalen = datalen;
+		packet->checksum = checksum((uint16_t *) buffer, (1 + datalen) / 2);
+	}
 }
 
-int gbn_socket() {
-    srand((unsigned)time(0));
-    return socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-}
 
-int gbn_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    return bind(sockfd, addr, addrlen);
-}
-
-int gbn_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    signal(SIGALRM, handler);
-    usingsockfd = sockfd;
-    serveraddr = addr;
-    serveraddrlen = addrlen;
-    prevsendtype = 0; /* fill package to be sent */
-    prevsent0.type = SYN;
-    prevsent0.seqnum = 0;
-    prevsent0.checksum = 0;
-    prevsent0.checksum = checksum(&prevsent0, sizeof(prevsent0)/2 );
-    if(checksum(&prevsent0, sizeof(prevsent0)/2) != 0) {
-        printf("assersion failed\n"); exit(1);
-    }
-    beginseq = prevsent0.seqnum;
-    currseq = prevsent0.seqnum;
-    maybe_sendto(sockfd, &prevsent0, sizeof(prevsent0), 0, addr, addrlen);
-    alarm(1);
-    /* some local variables to store SYNACK */
-    gbnhdronly tmpbuf;
-    struct sockaddr_in si_tmp;
-    int tmp_slen;
-    gbnhdronly* received;
-RECVAGAIN:
-    recvfrom(sockfd, &tmpbuf, sizeof(tmpbuf), 0, &si_tmp, &tmp_slen); /* program will stick here until receive something. */
-    /* if timeout, handler will be evoked and resend SYN. Then, process will return to recvfrom here and wait ... */
-    printf("received type: %d\n", tmpbuf.type);
-    if(checksum(&tmpbuf, sizeof(tmpbuf)/2) != 0) {
-        printf("checksum failed ...\n");
-        goto RECVAGAIN;
-    }
-
-    received = &tmpbuf;
-    if(received->type == SYNACK) {
-        alarm(0); /* cancel the alarm */
-        numtried = 0;
-        return 1; /* positive number to indicate success */
-    } else {
-        goto RECVAGAIN;
-    }
-}
-
-int gbn_close(int s) {
-    if(s != usingsockfd)
-        return -1;
-    prevsendtype = 0; /* fill FIN pack to be sent */
-    prevsent0.type = FIN;
-    prevsent0.seqnum = 0;
-    prevsent0.checksum = 0;
-    prevsent0.checksum = checksum(&prevsent0, sizeof(prevsent0)/2 );
-    if(checksum(&prevsent0, sizeof(prevsent0)/2) != 0) {
-        printf("assersion failed (2)\n"); exit(1);
-    }
-    //
-    currseq = prevsent0.seqnum;
-    maybe_sendto(s, &prevsent0, sizeof(prevsent0), 0, serveraddr, serveraddrlen);
-    alarm(1);
-    gbnhdronly received;
-    struct sockaddr_in si_tmp;
-    int tmp_slen;
-    /* logic here is very similar to what happened in gbn_connect() */
-RECVAGAIN:
-    recvfrom(s, &received, sizeof(received), 0, &si_tmp, &tmp_slen);
-    if(checksum(&received, sizeof(received)/2) != 0) {
-        printf("checksum failed ...\n");
-        goto RECVAGAIN;
-    }
-    if(received.type == FINACK) {
-        alarm(0);
-        numtried = 0;
-        return 1;
-    } else {
-        goto RECVAGAIN;
-    }
-}
-
-int gbn_send(int s, char *buf, size_t len, int flags) {
-    if(s != usingsockfd)
-        return -1;
-    /* ... */
-    /* below are used to receive and temporarily store ACKs */
-    gbnhdronly tmpbuf;
-    struct sockaddr_in si_tmp;
-    int tmp_slen;
-    gbnhdronly* received;
-    /* ... */
-    int i = 0, j, t;
-    while(i < len) {
-        /* again, logic here is similar to gbn_connect(). please read that function first if confused */
-        prevsent1.type = DATA;
-        prevsent1.seqnum = i + 1;
-        /* note that i starts from 0 but seqnum starts from 1, so seqnum = i + 1 */
-        prevsent1.checksum = 0;
-        j = 0;
-        prevsent1.bodylen = 0;
-        while(j < DATALEN && (i+j) < len) { /* fill the payload from buf (which was read from file) */
-            prevsent1.data[j] = buf[i+j];
-            j++;
-            prevsent1.bodylen++;
-        }
-        //
-        prevsent1.checksum = checksum(&prevsent1, sizeof(prevsent1)/2 );
-        //
-        prevsendtype = 1;
-        currseq = prevsent1.seqnum;
-        //printf("currseq: %d ...\n", prevsent1.seqnum);
-        printf("%d\n", prevsent1.seqnum);
-        maybe_sendto(s, &prevsent1, sizeof(prevsent1), 0, serveraddr, serveraddrlen);
-        alarm(1);
-        /* fill and send second DATA pack if in fast mode */
-        if(sendsecond && i + DATALEN < len) {
-            prevsent2.type = DATA;
-            prevsent2.seqnum = i + DATALEN + 1;
-            prevsent2.checksum = 0;
-            t = 0;
-            prevsent2.bodylen = 0;
-            while(t < DATALEN && (i+DATALEN+t) < len) {
-                prevsent2.data[t] = buf[i+DATALEN+t];
-                t++;
-                prevsent2.bodylen++;
-            }
-            prevsent2.checksum = checksum(&prevsent2, sizeof(prevsent2)/2 );
-            maybe_sendto(s, &prevsent2, sizeof(prevsent2), 0, serveraddr, serveraddrlen);
-        } else if(sendsecond) { /* when there is no more pack to send in this chunk */
-            sendsecond = 0;
-        }
-        /* ... */
-RECVAGAIN:
-        //printf("waiting here for ACK ...\n");
-        recvfrom(s, &tmpbuf, sizeof(tmpbuf), 0, &si_tmp, &tmp_slen);
-        //printf("got something ...\n");
-        if(checksum(&tmpbuf, sizeof(tmpbuf)/2) != 0) {
-            printf("checksum failed ...\n");
-            goto RECVAGAIN;
-        }
-        received = &tmpbuf;
-        printf("received DATA-ACK? ");
-        printf("seqnum is %d\n", received->seqnum);
-        /* wrong assumption... branch commented below will never happen */
-        /* if(received->type == DATA) {
-            //printf("strange ...\n");
-            maybe_sendto(s, &prevsent1, sizeof(prevsent1), 0, serveraddr, serveraddrlen);
-            goto RECVAGAIN;
-        } */
-        if(received->type == DATAACK) {
-            //printf("got DATAACK\n");
-            //printf("seqnum: %d\n\n", received->seqnum);
-            if(received->seqnum == currseq) {
-                //printf("???\n");
-                alarm(0);
-                numtried = 0;
-                i = i + j;      /* i & seqnum are sequence numbers of bytes, not those of packages */
-                sendsecond = 1; /* switch to fast mode */
-                continue;
-            } else {
-                //printf("broken package, receiving again ...\n");
-                goto RECVAGAIN;
-            }
-        } else {
-            //printf("wrong package, receiving again ...\n");
-            goto RECVAGAIN;
-        }
-    }
-    return 1;
+int is_timeout() {
+	if (s.timed_out == 0) {
+		s.timed_out = -1;
+		return 0;
+	}
+	return -1;
 }
 
 /*
-below is only used by receiver
-*/
-
-int gbn_listen(int sockfd, int backlog) {
-    /* may do some server-side initialization here in more scalable solution */
-    return 1; /* currently it's okay because receiver talks to only one sender at a time */
+ * params:
+ * 1.packet,
+ * 2.expected type
+ */
+int check_packetType(const gbnhdr packet, int type) {
+	if (packet.type != type) return -1;
+	return 0;
 }
 
-int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
-    //char buf[DATALEN + 10];
-    gbnhdronly tmpbuf;
-RECVAGAIN:
-    recvfrom(sockfd, &tmpbuf, sizeof(tmpbuf), 0, client, socklen);
-    //
-    if(checksum(&tmpbuf, sizeof(tmpbuf)/2) != 0) {
-        printf("checksum failed ...\n");
-        goto RECVAGAIN;
-    }
-    /* store information of sender for later use */
-    usingsockfd = sockfd;
-    clientaddr = client;
-    clientaddrlen = *socklen;
-    gbnhdronly* received;
-    received = &tmpbuf;
-    if(received->type == SYN) {
-        beginseq = received->seqnum;
-        currseq = 1;
-        /* create & fill SYNACK pack */
-        gbnhdronly synackpack;
-        synackpack.type = SYNACK;
-        synackpack.seqnum = beginseq;
-        synackpack.checksum = 0;
-        //
-        synackpack.checksum = checksum(&synackpack, sizeof(synackpack)/2 );
-        //
-        maybe_sendto(sockfd, &synackpack, sizeof(synackpack), 0, clientaddr, clientaddrlen);
-        //printf("accepted.\n");
-        return sockfd;
-    } else {
-        goto RECVAGAIN;
-    }
+/*
+ * params: 1. packet, 2. expected expected number
+ * rec_seqnum should be expected seqnum
+ * seq for ACK should be last sent seqnum
+ */
+int check_seqnum(const gbnhdr packet, int expected) {
+	if (packet.seqnum != expected) return -1;
+	return 0;
 }
 
-ssize_t gbn_recv(int sockfd, uint8_t *buf, size_t len, int flags) {
-    if(sockfd != usingsockfd)
-        return -1;
-    //char tmpbuf[DATALEN + 10];
-    gbnhdr tmpbuf;
+ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
+	/* split data into multiple packets */
+	int numPackets = (int) len / DATALEN;
+	int lastPacketSize = len % DATALEN;
+	if (len % DATALEN != 0) numPackets ++;
+	printf("in send and ready to send %i packets\n", numPackets);
+	int attempts[numPackets];
+	memset(attempts, 0, numPackets * sizeof(int));
+	char * slicedBuf = malloc(DATALEN);
+	int i = 0;
+	signal(SIGALRM, sig_handler);
+
+	while (i < numPackets) {
+		int j = 0;
+
+		while ( i < numPackets && j < s.mode) {
+			printf("sending packet %i\n", i);
+			if (attempts[i] >= MAX_ATTEMPT) {
+				s.state = CLOSED;
+				free(slicedBuf);
+				return -1;
+			}
+			
+			int currSize = DATALEN;
+			if (i == numPackets -1) currSize = lastPacketSize;
+			
+			memset(slicedBuf, '\0', currSize);
+			memcpy(slicedBuf, buf + i * DATALEN, currSize);
+
+			gbnhdr packet;
+			make_packet(&packet, DATA, s.send_seqnum, -1, slicedBuf, currSize);
+			printf("db2 sending type: %d, data: %s\n", packet.type, packet.data);
+			if (attempts[i] < MAX_ATTEMPT && sendto(sockfd, &packet, sizeof(packet), 0, &serv, serv_len) == -1) {
+				attempts[i] ++;
+				continue;
+			}
+			if (j == 0) alarm(TIMEOUT);
+			s.send_seqnum ++;
+			j++;
+			i++;
+		}
+
+		int unACK = j;
+		while (unACK > 0) {
+			/* receive ack header */
+			gbnhdr rec_header;
+			struct sockaddr tmp;
+			socklen_t tmp_int;
+			maybe_recvfrom(sockfd, (char *)&rec_header, sizeof(rec_header), 0, &tmp, &tmp_int);
+			/* verify there is no timeout, verify type = dataack and seqnum are expected */
+			if (is_timeout() == -1 && check_packetType(rec_header, DATAACK) == 0
+			&& check_seqnum(rec_header, s.rec_seqnum) == 0) {
+				printf("received successfully\n");
+				s.mode = s.mode == SLOW ? MODERATE : FAST;
+				s.rec_seqnum ++;
+				unACK --;
+				alarm(TIMEOUT); 
+			} else {
+				i -= s.send_seqnum - s.rec_seqnum;
+				s.send_seqnum = s.rec_seqnum;
+				s.mode = SLOW;
+				attempts[i] ++;
+				break;
+			}
+		}
+	}
+	free(slicedBuf);
+	return 0;
+}
+
+ssize_t gbn_recv(int sockfd, void *buf, size_t len, int flags){
+	/* receiver receive packet from sender and if valid, send DATAACK */
+	printf ("in receive\n");
+	
+	gbnhdr sender_packet;
+
+	struct sockaddr t;
+	struct sockaddr* tmp = &t;
+	socklen_t t_int;
+	socklen_t* tmp_int = &t_int;
+
     struct sockaddr_in si_tmp;
-    int tmpsocklen;
-    gbnhdr* received;
-RECVAGAIN:
-    received = &tmpbuf;
-    recvfrom(sockfd, &tmpbuf, sizeof(tmpbuf), 0, &si_tmp, &tmpsocklen);
-    printf("received type: %d\n", received->type);
-    if(received->type == SYN && received->seqnum == 0) {
-        if(checksum(&tmpbuf, sizeof(gbnhdronly)/2) != 0) {
-            printf("checksum failed ...\n");
-            goto RECVAGAIN;
-        }
-        gbnhdronly rsynackpack;
-        rsynackpack.type = SYNACK;
-        rsynackpack.seqnum = 0;
-        rsynackpack.checksum = 0;
-        //
-        rsynackpack.checksum = checksum(&rsynackpack, sizeof(rsynackpack)/2 );
-        //
-        maybe_sendto(sockfd, &rsynackpack, sizeof(rsynackpack), 0, clientaddr, clientaddrlen);
-        goto RECVAGAIN;
-    }
-    if(received->type == FIN && received->seqnum == 0) {
-        if(checksum(&tmpbuf, sizeof(gbnhdronly)/2) != 0) {
-            printf("checksum failed ...\n");
-            goto RECVAGAIN;
-        }
-        
-        gbnhdronly finackpack;
-        finackpack.type = FINACK;
-        finackpack.seqnum = 0;
-        finackpack.checksum = 0;
-        //
-        finackpack.checksum = checksum(&finackpack, sizeof(finackpack)/2 );
-        //
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        maybe_sendto(sockfd, &finackpack, sizeof(finackpack), 0, clientaddr, clientaddrlen);
-        return 0;
-    }
-    if(checksum(&tmpbuf, sizeof(tmpbuf)/2) != 0) {
-        printf("checksum failed ...\n");
-        goto RECVAGAIN;
-    }
-    //printf("received!\n");
-    //printf("type: %d\n", received->type);
-    //printf("seqnum is %d should be ", received->seqnum);
-    //printf("%d\n%d\n%d\n", currseq+lastdatalen, currseq, lastdatalen);
-    //
-    
-    if(received->seqnum == 1 & currseq >1000000) {
-        currseq = 1;
-        lastdatalen = 0;
-    }
-    
-    //
-    if(received->type == DATA && received->seqnum < currseq+lastdatalen) {
-        gbnhdronly ulackpack;
-        ulackpack.type = DATAACK;
-        ulackpack.seqnum = received->seqnum;
+    socklen_t tmpsocklen;
 
-        ulackpack.checksum = 0;
-        //
-        ulackpack.checksum = checksum(&ulackpack, sizeof(ulackpack)/2 );
-        //
-        maybe_sendto(sockfd, &ulackpack, sizeof(ulackpack), 0, clientaddr, clientaddrlen);
-        printf("getting earlier packs again... re-recv\n");
-        goto RECVAGAIN;
-    } else if(received->type == DATA && received->seqnum == currseq+lastdatalen) {
-        gbnhdronly dataackpack;
-        dataackpack.type = DATAACK;
-        dataackpack.seqnum = received->seqnum;
-        printf("%d\n", received->seqnum);
-        dataackpack.checksum = 0;
-        //
-        dataackpack.checksum = checksum(&dataackpack, sizeof(dataackpack)/2 );
-        //
-        maybe_sendto(sockfd, &dataackpack, sizeof(dataackpack), 0, clientaddr, clientaddrlen);
-        for(int ii = 0; ii < received->bodylen; ii++) {
-            buf[ii] = received->data[ii];
-        }
-        currseq = received->seqnum;
-        lastdatalen = received->bodylen;
-        return lastdatalen;
-    } else {
-        //printf("wrong or broken pack... re-recv\n");
-        goto RECVAGAIN;
-    }
+
+RECV:
+	if (recvfrom(sockfd, &sender_packet, sizeof(sender_packet), 0, (struct sockaddr*)&si_tmp, &tmpsocklen) == -1) {
+		/*printf("error in gbn_recv pl1\n");*/
+		goto RECV;
+	}
+	printf("gbn_recv pl1 success, type: %d, data: %s\n", sender_packet.type, sender_packet.data);
+
+	/* if a data packet is received, check packet to verify its type */
+	/*if (check_packetType(sender_packet, DATA) == 0){*/
+	if (sender_packet.type == DATA) {
+		alarm(TIMEOUT);
+		/* check data validity */
+		if (check_seqnum(sender_packet, s.rec_seqnum) == -1) {
+			 printf("received an unexpected seqnum, discarding data...\n");
+			return 0;
+		}
+		printf("juuuust test db2\n");
+		int sender_packet_size = sender_packet.datalen;
+		printf("juuuust test db2.5\n");
+		if (checksum((uint16_t *)&sender_packet.data, (1 + sender_packet_size) / 2) == -1) {
+			printf("data is corrupt\n");
+			return 0;
+		}
+		printf("juuuust test db3\n");
+
+		memcpy(buf, sender_packet.data, sender_packet_size);
+		printf("juuuust test db4\n");
+		printf("sender_packet.data: %s\n", sender_packet.data);
+		/* receiver reply with DATAACK header with seqnum received */
+		gbnhdr rec_header;
+		make_packet(&rec_header, DATAACK, s.rec_seqnum, 0, NULL, 0);
+		printf("juuuust test db5\n");
+		if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, tmp, *tmp_int) == -1) {
+			printf ("error sending in gbn_recv\n");
+			return -1;
+		}
+		printf("juuuust test db6\n");
+		printf("sent dataack with seqnum %i\n", s.rec_seqnum);
+		/* if successfully send ACK, expected next rec_seqnum ++ */
+		s.rec_seqnum ++;
+		return sender_packet_size;
+	/* if a connection teardown request is received, reply with FINACK header */
+	} else if (check_packetType(sender_packet, FIN) == 0) {
+		printf("reply with FINACK header \n");
+		gbnhdr rec_header;
+		make_packet(&rec_header, FINACK, 0, 0, NULL, 0);
+		printf("db4 sending type: %d\n", rec_header.type);
+		if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &s.receiverServerAddr, s.receiverSocklen) == -1) return -1;
+		s.state = FIN_RCVD;
+		return 0;
+	}
+
+	return(-1);
 }
 
-#endif
 
+int gbn_close(int sockfd){
+	printf("in connection close\n");
+    printf("state %i\n", s.state);
+	/* sender initiate a FIN request and wait for FINACK */
+    while (1) {
+    	if (s.state == ESTABLISHED || s.state == SYN_SENT || s.state == SYN_RCVD) {
+			printf("sending fin to close connection \n");
+			gbnhdr send_header;
+			make_packet(&send_header, FIN, 0, 0, NULL, 0);
+			printf("db5 sending type: %d\n", send_header.type);
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &send_header, sizeof(send_header), 0, &cli, cli_len) == -1) return -1;
+			s.state = FIN_SENT;
+			printf("fin sent to close connection\n");
+
+		}
+		else if (s.state == FIN_SENT) {
+			gbnhdr finack_packet;
+			printf("finack sent to close connection\n");
+			if (recvfrom(sockfd, &sender_packet, sizeof(sender_packet), 0, (struct sockaddr*)&si_tmp, &tmpsocklen) == -1) {
+				continue;
+			}
+			if (sender_packet.type == FINACK) return 0;
+		/* if receiver sees a FIN header, reply with FINACK and close socket connection */
+		} else if (s.state == FIN_RCVD) {
+			gbnhdr rec_header;
+			make_packet(&rec_header, FINACK, 0, 0, NULL, 0);
+			printf("db9 sending type: %d\n", rec_header.type);
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, &cli, cli_len) == -1) return -1;
+			return 0;
+		}
+    }
+	return(-1);
+}
+
+int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen){
+	if (sockfd < 0) return -1;
+	printf("in gbn connect\n");
+	/* Define Global State */
+	s.mode = SLOW;
+	s.senderSocklen = socklen;
+	serv_len = socklen;
+	serveraddrlen = socklen;
+	printf("gbn_connect db-1\n");
+	*serveraddr = *server;
+	serv = *server;
+	
+
+	gbnhdr send_header;
+	printf("gbn_connect db0\n");
+	make_packet(&send_header, SYN, 0, 0, NULL, 0);
+
+	signal(SIGALRM, sig_handler);
+
+
+	int attempt = 0;
+	s.timed_out = -1;
+	printf("gbn_connect db1\n");
+	/* send SYN and wait for SYNACK. after that, send a SYNACK back. */
+	while (attempt < MAX_ATTEMPT) {
+		printf("db7 sending type: %d\n", send_header.type);
+		if (sendto(sockfd, &send_header, sizeof(send_header), 0, &serv, socklen) == -1 ) {
+			attempt ++;
+			printf("sender send syn failed\n");
+			continue;
+		}
+		printf("gbn_connect db2\n");
+		s.receiverServerAddr = *server;
+		s.receiverSocklen = socklen;
+		s.state = SYN_SENT;
+		printf("sent type: %d\n", send_header.type);
+		alarm(TIMEOUT);
+		/* waiting for receiving SYNACK */
+		gbnhdr rec_header;
+		socklen_t tmp_int;
+		if (maybe_recvfrom(sockfd, (char *)&rec_header, sizeof(rec_header), 0, &serv, &tmp_int) == -1) {
+			printf("sender error in recvfrom syn ack\n");
+			attempt ++;
+			continue;
+		}
+		/* check for timeout, check if header type is SYNACK */
+		if (check_packetType(rec_header, SYNACK) == 0) {
+			printf("sender received synack header\n");
+			s.state = ESTABLISHED;
+			printf("sender connection established\n");
+			make_packet(&send_header, SYNACK, 0, 0, NULL, 0);
+			printf("sending s yn ack!!!!!!!!!!!!!!!!!!!!!");
+			printf("db8 sending type: %d\n", send_header.type);
+			sendto(sockfd, &send_header, sizeof(send_header), 0, &serv, s.receiverSocklen);
+			return 0;
+		}
+		printf("sender received non-synack\n");
+		printf("recived type: %d\n",rec_header.type);
+		attempt ++;
+	}
+	/* if reach max number of tries, close the connection */
+	s.state = CLOSED;
+	return(-1);
+}
+
+int gbn_listen(int sockfd, int backlog){
+	printf("in listen\n");
+	while(0) {
+		gbnhdr send_header;
+		/* receiver receive from (listen to) header of the request to connect */
+		if (maybe_recvfrom(sockfd, (char *)&send_header, sizeof(send_header), 0, &s.senderServerAddr, &s.senderSocklen) == -1) {
+			printf("error rec syn from sender\n");
+			return -1;
+		}
+
+		if (check_packetType(send_header, SYN) == 0) {
+			s.state = SYN_RCVD;
+			printf("received syn header\n");
+			return 0;
+		}
+		printf("received send_header type: %d\n",send_header.type);
+	}
+
+	return 0;
+}
+
+int gbn_bind(int sockfd, const struct sockaddr *server, socklen_t socklen){
+	/* pointer to local struct on receiver server where sender address is to be stored */
+	printf("in bind\n");
+	s.receiverServerAddr = *server;
+	s.receiverSocklen = socklen;
+	s.timed_out = -1;
+	return bind(sockfd, server, socklen);
+}	
+
+int gbn_socket(int domain, int type, int protocol){
+		
+	/*----- Randomizing the seed. This is used by the rand() function -----*/
+	printf("in gbn_socket\n");
+	srand((unsigned)time(0));
+
+	return socket(domain, type, protocol);
+}
+
+int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen){
+	/*
+	 * receiver send to sender either RST or SYNACK based on global state
+	 * if accept, initialize the receiver sequence number to 0
+	*/
+	s.rec_seqnum = 0;
+	gbnhdr rec_header;
+	printf("in accept\n");
+
+	/* if connection teardown initiated, reject connection by sending RST */
+	if (s.state == FIN_SENT) make_packet(&rec_header, RST, 0, 0, NULL, 0);
+	/* accept connection initiation by sending header with SYNACK */
+	else make_packet(&rec_header, SYNACK, 0, 0, NULL, 0);
+	
+	
+
+	signal(SIGALRM, sig_handler);
+
+
+	int attempt = 0;
+	s.timed_out = -1;
+	
+	
+	struct sockaddr t;
+	struct sockaddr* tmp = &t;
+	socklen_t t_int;
+	socklen_t* tmp_int = &t_int;
+	cli = *client;
+	cli_len = *socklen;
+	int syned = 0;
+	/* wait for SYN, then send SYNACK and wait for SYNACK. */
+	while (attempt < MAX_ATTEMPT) {
+		printf("enter accpet while\n");
+		gbnhdr send_header_syn;
+		if (!syned) {
+			if (maybe_recvfrom(sockfd, (char *)&send_header_syn, sizeof(send_header_syn), 0, tmp, tmp_int) == -1) {
+				printf("error rec syn from sender\n");
+				return -1;
+			}
+			if (check_packetType(send_header_syn, SYN) != 0) {
+				printf("wrong type received. expect SYN\n");
+				attempt ++;
+				continue;
+			}
+			syned = 1;
+			cli = *tmp;
+			printf("receive type: %d\n", send_header_syn.type);
+		}
+		printf("sending type: %d\n", rec_header.type);
+		if (sendto(sockfd, &rec_header, sizeof(rec_header), 0, tmp, *tmp_int) == -1 ) {
+			attempt ++;
+			printf("receiver send synack failed\n");
+			continue;
+		}
+		s.senderServerAddr = *tmp;
+		s.senderSocklen = *tmp_int;
+		printf("receiver sent synack header\n");
+		alarm(TIMEOUT);
+		/* waiting for receiving SYNACK */
+		gbnhdr send_header;
+		printf("old send_header type: %d\n", send_header.type);
+		if (maybe_recvfrom(sockfd, (char *)&send_header, sizeof(send_header), 0, tmp, tmp_int) == -1) {
+			printf("receiver error in recvfrom syn ack\n");
+			attempt ++;
+			continue;
+		}
+		printf("new send_header type: %d\n", send_header.type);
+		/* check for timeout, check if header type is SYNACK */
+		if (check_packetType(send_header, SYNACK) == 0) {
+			printf("receiver received synack header\n");
+			s.state = ESTABLISHED;
+			printf("receiver connection established\n");
+			return sockfd;
+		}
+		printf("received non-synack\n");
+		printf("recived type: %d\n",send_header.type);
+		attempt ++;
+	}
+
+	return -1;
+}
+
+ssize_t maybe_recvfrom(int  s, char *buf, size_t len, int flags, struct sockaddr *from, socklen_t *fromlen){
+
+	/*----- Packet not lost -----*/
+	if (rand() > LOSS_PROB*RAND_MAX){
+
+
+		/*----- Receiving the packet -----*/
+		int retval = recvfrom(s, buf, len, flags, from, fromlen);
+
+		/*----- Packet corrupted -----*/
+		if (rand() < CORR_PROB*RAND_MAX){
+			/*----- Selecting a random byte inside the packet -----*/
+			int index = (int)((len-1)*rand()/(RAND_MAX + 1.0));
+
+			/*----- Inverting a bit -----*/
+			char c = buf[index];
+			if (c & 0x01)
+				c &= 0xFE;
+			else
+				c |= 0x01;
+			buf[index] = c;
+		}
+
+		return retval;
+	}
+	/*----- Packet lost -----*/
+	return (len);  /* Simulate a success */
+}
